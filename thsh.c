@@ -22,10 +22,18 @@
 
 // Assume no input line will be longer than 1024 bytes
 #define MAX_INPUT 1024
+
 //reserved internal commands (priority over external commands if overlap exists)
-static const char EXIT[] = "exit";
-static const char CD[] = "cd";
-static const char REDIRECTS[] = {'|', '>', '<'};
+enum INTERNAL_CMD {
+    NIL, EXIT, CD, GOHEELS,
+};
+static const char *CMD_MAPPING[] = {
+    "nil", "exit", "cd", "goheels", 
+};
+static const char REDIRECTS[] = {'|', '>', '<',};
+
+//path for ascii art
+static char *HEEL_ART = "HeelArt.art";
 
 //wrapper for parsed arguments
 struct Payload {
@@ -40,27 +48,26 @@ struct Navigation {
 
 //function headers
 void execute(char *cmd, struct Navigation *nav); 
-int isInternalCommand(char *cmd);
+int isInternalCommand(char *token);
 int spawnProcess(char *cmd, struct Payload args);
 int isAbsoluteOrRelativePath(char *path);
 char* findBinary(char *path, char *fileName);
 char* concat(char *s1, char *s2);
 int isXFile(char* file);
-char* truncPath(char *file);
-struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimiters, char *token, char* parserState);
+struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimiters, char **token, char* parserState);
 int isArgument(char *arg);
 int isSpecialRedirect(char *arg);
-struct Payload scrapeArguments(char *token, const char *delimiters, char* parserState);
+struct Payload scrapeArguments(char **token, const char *delimiters, char* parserState);
 int isDirectory(char *path);
-
+int changeDirectory(struct Payload Args, struct Navigation *nav);
+int isFile(char *file);
 
 int main (int argc, char **argv, char **envp) {
     int finished = 0;
     //255 is the usual max path length in linux
     //TODO: this changed the cd for some reason..
-    //char prompt[255];
+    char prompt[MAX_INPUT];
     //strncpy(prompt, " thsh> ", strlen(" thsh> "));
-    char *prompt = "%>";
     char cmd[MAX_INPUT];
     //info regarding navigation and directory status
     struct Navigation nav;
@@ -74,8 +81,10 @@ int main (int argc, char **argv, char **envp) {
         int count;
         
         //setting prompt with current directory prefix
-        //memset(prompt, 0, sizeof(prompt));
-        //sprintf(prompt, "\n[%s] thsh> ", nav.pwd);
+        getcwd(nav.pwd, MAX_INPUT);
+        memset(prompt, '\0', strlen(prompt));
+        sprintf(prompt, "[%s] thsh> ", nav.pwd);
+
         rv = write(1, prompt, strlen(prompt));
         if (!rv) { 
             finished = 1;
@@ -105,37 +114,73 @@ int main (int argc, char **argv, char **envp) {
 
 //TODO: return status code to parent?
 //functionality for changing the working directory
-void changeDirectory(struct Payload Args, struct Navigation *nav) {
+int changeDirectory(struct Payload Args, struct Navigation *nav) {
+    int responseStatus = 0;
+
     //if no arguments are specified with cd, we assume a change to the home directory
-    getcwd(nav->pwd, MAX_INPUT);
-    //write(1, "\n-\n", 4 );
-    //write(1, nav->pwd, strlen(nav->pwd));
-    //write(1, "\n-\n", 4 );
-    //write(1, nav->lastDirectory, strlen(nav->lastDirectory));
-    //write(1, "\n-\n", 4);
-    if(Args.argumentCount == 0) {
-        chdir(getenv("HOME"));
+    if(Args.argumentCount == 0 || (Args.argumentCount==1 && Args.arguments[0][0] == '~')) {
+        responseStatus = chdir(getenv("HOME"));
         memset(nav->lastDirectory, '\0', MAX_INPUT);
         strcpy(nav->lastDirectory, nav->pwd);
     } else {
         char *targetDirectory;
         targetDirectory = Args.arguments[0];
         if(strlen(targetDirectory)==1 && targetDirectory[0]=='-') {
-            chdir(nav->lastDirectory);
+            responseStatus = chdir(nav->lastDirectory);
             memset(nav->lastDirectory, '\0', MAX_INPUT);
             strcpy(nav->lastDirectory, nav->pwd);
         } else if(isDirectory(targetDirectory)) {
             //write(1, targetDirectory, strlen(targetDirectory));
-            chdir(targetDirectory);
+            responseStatus = chdir(targetDirectory);
             memset(nav->lastDirectory, '\0', MAX_INPUT);
             strcpy(nav->lastDirectory, nav->pwd);
         } else {
             char *noDirectory = concat(targetDirectory, ": is not a directory\n");
             write(1, noDirectory, strlen(noDirectory));
         }
-    } 
+    }
+
+    return responseStatus;
 }
 
+
+//set path variable for return code
+void checkCode(int code) {
+    if(code == -1) {
+        exit(EXIT_FAILURE);
+    }
+}
+
+
+int buildHeelArt(struct Navigation *nav) {
+    if(isFile(HEEL_ART)) {
+        //"Tar" flow
+        execute("clear", nav);
+        char* payload = concat("head -25 ", HEEL_ART);
+        execute(payload, nav);
+        free(payload);
+        sleep(2);
+        execute("clear", nav);
+        //"Heel" flow
+        payload = concat("sed -n 25,48p ", HEEL_ART);
+        execute(payload, nav);
+        free(payload);
+        sleep(2);
+        execute("clear", nav);
+        //The actual Tar Heel
+        payload = concat("sed -n 53,87p ", HEEL_ART);
+        execute(payload, nav);
+        free(payload);
+        sleep(2);
+        execute("clear", nav);
+        return 0; 
+    } else {
+        char fileError[80]; 
+        sprintf(fileError, "Please place \"%s\" in your cwd or set $HEEL_PATH to its location\n", HEEL_ART);
+        write(1, fileError, strlen(fileError));
+        return -1;
+    }
+}
 
 void execute(char *cmd, struct Navigation *nav) {
     const char *delimiters = " \n\r\t";
@@ -148,16 +193,21 @@ void execute(char *cmd, struct Navigation *nav) {
     while(token != NULL) {
         if(isInternal) {
             token = strtok_r(NULL, delimiters, &parserState);
-            struct Payload Args = scrapeArguments(token, delimiters, parserState);
-            
+            struct Payload Args = scrapeArguments(&token, delimiters, parserState);
+            int responseCode = 0;
+
             switch(isInternal) {
-                case 1:
+                case EXIT:
                     exit(3);
                     break;
-                case 2:
-                    changeDirectory(Args, nav);
+                case CD:
+                    responseCode = changeDirectory(Args, nav);
+                    break;
+                case GOHEELS:
+                    responseCode = buildHeelArt(nav);
                     break;
             }
+            checkCode(responseCode);
         } else { 
             char *pathAttempts;
             char *absoluteFilePath;
@@ -177,7 +227,7 @@ void execute(char *cmd, struct Navigation *nav) {
 
             if(absoluteFilePath != NULL) {
                 token = strtok_r(NULL, delimiters, &parserState);
-                struct Payload Args = scrapeProcessArguments(absoluteFilePath, delimiters, token, parserState);
+                struct Payload Args = scrapeProcessArguments(absoluteFilePath, delimiters, &token, parserState);
                 spawnProcess(absoluteFilePath, Args);
                 free(Args.arguments);
                 break;
@@ -193,7 +243,7 @@ void execute(char *cmd, struct Navigation *nav) {
 }
 
 //scrape the arguments that directly follow a particular recognized command
-struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimiters, char* token, char* parserState) {
+struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimiters, char** token, char* parserState) {
     //when passing arguments to execv, we must include file descriptor name and an ending NULL terminator 
     struct Payload Args;
     unsigned long currentArgumentSize = 0;
@@ -203,12 +253,12 @@ struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimi
     *arguments = (char *) malloc(strlen(absoluteFilePath+1));
     arguments[0] = absoluteFilePath;
 
-    while(token != NULL && isArgument(token)) {
+    while(*token != NULL && isArgument(*token)) {
         argumentCount++;
         arguments = (char **) realloc(arguments, argumentCount * sizeof(char *));
-        arguments[argumentCount-1] = (char *) malloc(strlen(token)+1); 
-        arguments[argumentCount-1] = token;
-        token = strtok_r(NULL, delimiters, &parserState);
+        arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1); 
+        arguments[argumentCount-1] = *token;
+        *token = strtok_r(NULL, delimiters, &parserState);
     }
 
     argumentCount++;
@@ -221,13 +271,13 @@ struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimi
 }
 
 
-struct Payload scrapeArguments(char *token, const char *delimiters, char* parserState) {
+struct Payload scrapeArguments(char **token, const char *delimiters, char* parserState) {
     struct Payload Args;
     char **arguments;
     arguments = NULL;
     int argumentCount = 0;
     
-    while(token != NULL && isArgument(token)) {
+    while(*token != NULL && isArgument(*token)) {
         argumentCount++;
 
         if(arguments==NULL) {
@@ -236,9 +286,9 @@ struct Payload scrapeArguments(char *token, const char *delimiters, char* parser
             arguments = (char **) realloc(arguments, argumentCount * sizeof(char *));
         }
 
-        arguments[argumentCount-1] = (char *) malloc(strlen(token)+1);
-        arguments[argumentCount-1] = token;
-        token = strtok_r(NULL, delimiters, &parserState);
+        arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1);
+        arguments[argumentCount-1] = *token;
+        *token = strtok_r(NULL, delimiters, &parserState);
     }
 
     Args.arguments = arguments;
@@ -296,6 +346,16 @@ int isXFile(char *file) {
     return isExecutable;
 } 
 
+//check if file exists, disregarding permissions
+int isFile(char *file) {
+    struct stat *fileInfo;
+    fileInfo = malloc(sizeof(struct stat));
+    int isFile = stat(file, fileInfo);
+    int fileStatus = isFile == 0;
+    free(fileInfo);
+    return fileStatus;
+}
+
 //check if the given path leads to a valid directory
 int isDirectory(char *path) {
     struct stat *directoryInfo;
@@ -328,13 +388,14 @@ int isAbsoluteOrRelativePath(char *path) {
 }
 
 //Internal command code mapping
-//TODO: right now you can't issue commands that start with the internal commands
-int isInternalCommand(char *cmd) {
-	if(strncmp(cmd, EXIT, strlen(EXIT)) == 0) {
-		return 1;
-	} else if(strncmp(cmd, CD, strlen(CD)) == 0) {
-        return 2;
-    } else {
+int isInternalCommand(char *token) {
+	if(strncmp(token, CMD_MAPPING[EXIT], strlen(token)) == 0) {
+		return EXIT;
+	} else if(strncmp(token, CMD_MAPPING[CD], strlen(token)) == 0) {
+        return CD;
+    } else if(strncmp(token, CMD_MAPPING[GOHEELS], strlen(token)) == 0) {
+        return GOHEELS;
+    } else{
 		return 0;
 	}
 }
