@@ -1,12 +1,14 @@
 /* COMP 530: Tar Heel SHell */
 /* Author: Morgan J. Howell */
 
+//I, Morgan James Howell, would like to pledge and sign the UNC Honor Code with this assignment which affirms that I did
+//not receive any help on this assignment or plagiarise code.
+
 //notes to self
 /*
 1. test the ins and outs of grep
 2. quotation and more precise argument parsing
-
-
+3. for some reason your debugger prints the command twice
 */
 
 #include <stdio.h>
@@ -20,16 +22,21 @@
 #include <string.h>
 #include <stddef.h>
 #include <time.h>
+#include <regex.h>
+#include <stdarg.h>
 
 // Assume no input line will be longer than 1024 bytes
 #define MAX_INPUT 1024
+// Every command can contain at most 512 embedded environment variables: len($1$2$3....$n) =1024
+// 512 = 1024/2 ->
+#define MAX_GROUPS 512
 
 //reserved internal commands (priority over external commands if overlap exists)
 enum INTERNAL_CMD {
-    NIL, EXIT, CD, GOHEELS,
+    NIL, EXIT, CD, GOHEELS, SET,
 };
 static const char *CMD_MAPPING[] = {
-    "nil", "exit", "cd", "goheels", 
+    "nil", "exit", "cd", "goheels", "set"
 };
 static const char REDIRECTS[] = {'|', '>', '<',};
 
@@ -38,6 +45,14 @@ static char *HEEL_ART = "HeelArt.art";
 
 //developer/debug mode ON=1/OFF=0
 static int DEBUG_MODE = 0;
+
+//constant pattern matching for valid environment variable sets
+static char* SET_ENV_PATTERN = "^([a-zA-Z0-9]+|[!@#\\$?%\\^\\&*\\)\\(+._-])\\=";
+static char* EMBEDDED_VAR = "\\$([a-zA-Z0-9]+|[!@#\\$?%\\^\\&*\\)\\(+._-])";
+static regex_t setReg;
+static regex_t embeddedVar;
+regmatch_t embedGroups[MAX_GROUPS];
+static int regexCompileStatus;
 
 //wrapper for parsed arguments
 struct Payload {
@@ -64,6 +79,7 @@ struct Debugger {
 #define ANSI_COLOR_RESET    "\x1b[0m" 
 #define ANSI_COLOR_GREEN   "\x1b[32m" //process or internal command kicks off or has sucessful return
 #define ANSI_COLOR_YELLOW  "\x1b[33m" //process that has been kicked off, but not terminated
+#define ANSI_COLOR_CYAN    "\x1b[36m"
 
 //function headers
 void execute(char *cmd, struct Navigation *nav, struct Debugger *debug); 
@@ -85,6 +101,12 @@ void checkExitCode(int code, struct Debugger *debug);
 char *getCurrentTime();
 int buildHeelArt(struct Navigation *nav, struct Debugger *debug);
 void updateAndLogLaunch(struct Debugger *debug, char *token);
+int setEnvVar(struct Navigation *nav, struct Debugger *debug, struct Payload *Args);
+int isValidEnvSet(char **varSet);
+char** parseEnvVar(char *arg);
+void reverse(char **var);
+char* interpolate(char *token);
+int hasVar(char *token);
 
 int main (int argc, char **argv, char **envp) {
     int finished = 0;
@@ -100,6 +122,14 @@ int main (int argc, char **argv, char **envp) {
     struct Debugger debug;
     if(argc>1) {
         setDebugger(argc, argv);
+    }
+
+    //precompile regexs for optimized pattern matching (for parsing environment variables)
+    regexCompileStatus = regcomp(&setReg, SET_ENV_PATTERN, 1);
+    regexCompileStatus = regcomp(&embeddedVar, EMBEDDED_VAR, 1);
+    if(regexCompileStatus) {
+        printf("fuck");
+        exit(3);
     }
 
     while (!finished) {
@@ -146,15 +176,20 @@ void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
     strcpy(tokenizedString, cmd);
     char *parserState;
     char *token = strtok_r(tokenizedString, delimiters, &parserState);
+    //interpolation calls preprocess the token for potentially embedded environment variables
+    token = interpolate(token);
     int isInternal = isInternalCommand(token);
     //maintain debugging info with both successful and failed command attempts
     if(DEBUG_MODE) updateAndLogLaunch(debug, token);
 
     while(token != NULL) {
+        //check to see if the provided command is an internal command
         if(isInternal) {
             token = strtok_r(NULL, delimiters, &parserState);
+            token = interpolate(token);
             struct Payload Args = scrapeArguments(&token, delimiters, parserState);
             int responseCode = 0;
+
             switch(isInternal) {
                 case EXIT:
                     exit(3);
@@ -165,8 +200,12 @@ void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
                 case GOHEELS:
                     responseCode = buildHeelArt(nav, debug);
                     break;
+                case SET:
+                    responseCode = setEnvVar(nav, debug, &Args);
+                    break;
             }
             checkExitCode(responseCode, debug);
+        //if the provided command is not internal, we begin our search in the path provided or $PATH
         } else { 
             char *pathAttempts;
             char *absoluteFilePath;
@@ -187,15 +226,16 @@ void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
 
             if(absoluteFilePath != NULL) {
                 token = strtok_r(NULL, delimiters, &parserState);
+                token = interpolate(token);
                 struct Payload Args = scrapeProcessArguments(absoluteFilePath, delimiters, &token, parserState);
                 responseCode = spawnProcess(absoluteFilePath, Args);
                 free(Args.arguments);
-                break;
             } else {
                 char *noCommand = concat(token, ": command could not be found\n");
                 write(1, noCommand, strlen(noCommand));
                 free(noCommand);
                 token = strtok_r(NULL, delimiters, &parserState);
+                token = interpolate(token);
                 responseCode = -1;
             }
             checkExitCode(responseCode, debug);
@@ -276,18 +316,6 @@ int isAbsoluteOrRelativePath(char *path) {
 	return 0;
 }
 
-//Internal command code mapping
-int isInternalCommand(char *token) {
-	if(strncmp(token, CMD_MAPPING[EXIT], strlen(token)) == 0) {
-		return EXIT;
-	} else if(strncmp(token, CMD_MAPPING[CD], strlen(token)) == 0) {
-        return CD;
-    } else if(strncmp(token, CMD_MAPPING[GOHEELS], strlen(token)) == 0) {
-        return GOHEELS;
-    } else{
-		return 0;
-	}
-}
 
 //fetch current time as string
 char *getCurrentTime() {
@@ -347,6 +375,7 @@ struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimi
         arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1); 
         arguments[argumentCount-1] = *token;
         *token = strtok_r(NULL, delimiters, &parserState);
+        *token = interpolate(*token);
     }
 
     argumentCount++;
@@ -377,6 +406,7 @@ struct Payload scrapeArguments(char **token, const char *delimiters, char* parse
         arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1);
         arguments[argumentCount-1] = *token;
         *token = strtok_r(NULL, delimiters, &parserState);
+        *token = interpolate(*token);
     }
 
     Args.arguments = arguments;
@@ -384,6 +414,84 @@ struct Payload scrapeArguments(char **token, const char *delimiters, char* parse
     return Args;
 }
 
+char* interpolate(char *token) {
+    if(token == NULL || strlen(token) == 0 || hasVar(token) == -1) {
+        return token;
+    } else {
+
+        char *buffer = malloc(MAX_INPUT);
+        char *interpolatedVar = malloc(MAX_INPUT); 
+        int tokenTick, bufferTick = 0, varTick = 0;
+
+        for(tokenTick=0; tokenTick<strlen(token); tokenTick++) {
+
+            if(token[tokenTick] == '$') {
+                tokenTick++;
+                //scrape the environment variable name indicated after the $
+                while(tokenTick<strlen(token) && token[tokenTick] != '$') {
+                    interpolatedVar[varTick] = token[tokenTick];
+                    tokenTick++;
+                    varTick++;
+                }
+                interpolatedVar[varTick] = '\0';
+                //attempt to find this variable in the local environment and splice into the original token
+                char* envVar = getenv(interpolatedVar);
+                //check to see if this variable actually exists
+                if(envVar != NULL) {
+                    strcat(buffer, envVar);
+                    bufferTick += strlen(envVar);
+                }
+                memset(interpolatedVar, '\0', strlen(interpolatedVar));
+                varTick = 0;
+                
+                //we must account for the case of N embedded environment vars within the same string
+                if(tokenTick>=strlen(token)) {
+                    break;
+                } else {
+                    tokenTick--;
+                    continue;
+                }
+
+            } else {
+                buffer[bufferTick] = token[tokenTick];
+                bufferTick++;
+            } 
+        }     
+        free(interpolatedVar);
+        return buffer;
+    }
+}
+
+/*
+//print arbitrary strings and variables
+void print(int num, ...) {
+    char buffer[MAX_INPUT];
+    va_list valist;
+    va_start(valist, num);
+    int i;
+    for(i=0;i<num;i++) {
+        if(i == 0) {
+            strcpy(buffer, va_arg(valist, char *))
+        } else {
+            strcat(buffer, va_arg(valist, char *));
+        }
+    }
+
+    memset(prntStr, '\0', strlen(prntStr));
+    snprintf(prntStr, sizeof(prntStr), "buffer: %s  | buffertick: %d", buffer, bufferTick);
+    write(1, prntStr, strlen(prntStr));
+}*/
+
+//return index of the first embedded variabled, denoted by $
+int hasVar(char *token) {
+    int i;
+    for(i=0; i<strlen(token); i++) {
+        if(token[i] == '$') {
+            return i;
+        }
+    }
+    return -1;
+}
 
 //attempt to find a binary executable within the paths provided, returning NULL if file is not found
 char* findBinary(char *path, char *fileName) {
@@ -445,7 +553,7 @@ int buildHeelArt(struct Navigation *nav, struct Debugger *debug) {
     }
 }
 
-
+//TODO: printing twice in debug after first CD call
 //functionality for changing the working directory
 int changeDirectory(struct Payload Args, struct Navigation *nav) {
     int responseStatus = 0;
@@ -469,20 +577,106 @@ int changeDirectory(struct Payload Args, struct Navigation *nav) {
         } else {
             char *noDirectory = concat(targetDirectory, ": is not a directory\n");
             write(1, noDirectory, strlen(noDirectory));
-            responseStatus = -1;
+            responseStatus = 1;
         }
     }
 
     return responseStatus;
 }
 
+//set environment variable
+int setEnvVar(struct Navigation *nav, struct Debugger *debug, struct Payload *Args) {
+    int responseStatus = -1;
+
+    if(!regexCompileStatus && Args->argumentCount == 1 && isValidEnvSet(&(Args->arguments[0]))) {
+            char **valVar = parseEnvVar(Args->arguments[0]);
+            //by default thsh will overwrite existing environment variables
+            responseStatus = setenv(valVar[0], valVar[1], 1);
+            free(valVar[0]);
+            free(valVar[1]);
+            free(valVar);
+    }
+    return responseStatus;
+}
+
+//test to see if the env var assignment is valid
+int isValidEnvSet(char **varSet) {
+    //if someone attempts to set $VAR=VAL, we will ignore the '$' and consider this a valid assignment
+    if((*varSet)[0] == '$') {
+        //memmove(*varSet, *varSet+1, strlen(*varSet));
+        (*varSet)++;
+    }
+    int isMatch;
+    isMatch = regexec(&setReg, *varSet, 0, NULL, 0);
+    return !isMatch;
+}
+
+//parse out the variable and value of a given environmet variable assignment
+char** parseEnvVar(char *arg) {
+    //value buffer
+    char* val;
+    val = malloc(strlen(arg)+1);
+    //var name buffer
+    char* var;
+    var = malloc(strlen(arg)+1);
+    //container for both the var and val
+    char **valVar = malloc(2*sizeof(char *)); 
+
+    //parsing var and val
+    int i = 0;
+    int j = strlen(arg)-1;
+    while(i<j) {
+        if(arg[i]!='=') {
+            val[i] = arg[i];
+            i++;
+        }
+        if(arg[j]!='=') {
+            var[strlen(arg)-1-j] = arg[j];
+            j--;
+        }
+    }
+    val[i] = '\0';
+    var[strlen(arg)-1-j] = '\0';
+
+    valVar[0] = val;
+    reverse(&var);
+    valVar[1] = var;
+    return valVar;
+}
+
+//reverse given string
+void reverse(char **var) {
+    int i;
+    for(i=strlen(*var)-1; i>=strlen(*var)/2; i--) {
+        char tmp = (*var)[i];
+        (*var)[i] = (*var)[strlen(*var)-1-i];
+        (*var)[strlen(*var)-1-i] = tmp;
+    }
+}
+
+//Internal command code mapping
+int isInternalCommand(char *token) {
+	if(strncmp(token, CMD_MAPPING[EXIT], strlen(token)) == 0) {
+		return EXIT;
+	} else if(strncmp(token, CMD_MAPPING[CD], strlen(token)) == 0) {
+        return CD;
+    } else if(strncmp(token, CMD_MAPPING[GOHEELS], strlen(token)) == 0) {
+        return GOHEELS;
+    } else if(strncmp(token, CMD_MAPPING[SET], strlen(token)) == 0)  {
+        return SET;
+    } else{
+		return 0;
+	}
+}
 
 /****************************************
  *                                      *
  *           DEBUGGING                  *
  *                                      *
  ****************************************/
-
+void flush(char **buffer) {
+    memset(*buffer, '\0', strlen(*buffer));
+}
 //set path variable for return code
 void checkExitCode(int code, struct Debugger *debug) {
     debug->exitStatus = code;
@@ -492,9 +686,13 @@ void checkExitCode(int code, struct Debugger *debug) {
     if(DEBUG_MODE) {
         char debuggerConsole[MAX_INPUT];
         char buffer[MAX_INPUT];
+        char *border = "\n--------------------------------\n";
         //information relevant to the command that was executed
-        strcpy(debuggerConsole,"\n--------------------------------\n");
-        snprintf(buffer, sizeof(buffer),"%sRUNNING: %s\n%s", ANSI_COLOR_GREEN, debug->cmd, ANSI_COLOR_RESET);
+        memset(buffer, '\0', strlen(buffer));
+        snprintf(buffer, sizeof(buffer),"\n%s%s%s\n", ANSI_COLOR_CYAN, border, ANSI_COLOR_RESET);
+        strcat(debuggerConsole, buffer);
+        memset(buffer, '\0', strlen(buffer));
+        snprintf(buffer, sizeof(buffer),"%sRAN: %s\n%s", ANSI_COLOR_GREEN, debug->cmd, ANSI_COLOR_RESET);
         strcat(debuggerConsole, buffer);
         memset(buffer, '\0', strlen(buffer));
         snprintf(buffer, sizeof(buffer), "executed at: %s \n", debug->cmdLaunch);
@@ -514,7 +712,9 @@ void checkExitCode(int code, struct Debugger *debug) {
         memset(buffer, '\0', strlen(buffer));
         snprintf(buffer, sizeof(buffer), "process ended at: %s \n", debug->cmdEnd);
         strcat(debuggerConsole, buffer);
-        strcat(debuggerConsole, "\n--------------------------------\n");
+        memset(buffer, '\0', strlen(buffer));
+        snprintf(buffer, sizeof(buffer),"%s%s%s\n\n", ANSI_COLOR_CYAN, border, ANSI_COLOR_RESET);
+        strcat(debuggerConsole, buffer);
         write(2, debuggerConsole, strlen(debuggerConsole));
     }
 }
@@ -525,7 +725,7 @@ void setDebugger(int argCount, char **args) {
     char *optionTarget = "-d";
     int i;
     for(i=1;i<argCount;i++) {
-        if(strlen(args[i]) == 2 && strncmp(args[i], optionTarget, strlen(optionTarget))) {
+        if(strlen(args[i]) == 2 && strncmp(args[i], optionTarget, strlen(optionTarget))==0) {
             DEBUG_MODE = 1;
         }
     }
@@ -537,6 +737,19 @@ void updateAndLogLaunch(struct Debugger *debug, char *token) {
     memset(debug->cmdLaunch, '\0', 50);
     strcpy(debug->cmdLaunch, getCurrentTime());
     char launchBuffer[MAX_INPUT];
+    memset(launchBuffer, '\0', strlen(launchBuffer));
     snprintf(launchBuffer, sizeof(launchBuffer),"%sRUNNING: %s\n%s", ANSI_COLOR_YELLOW, debug->cmd, ANSI_COLOR_RESET); 
     write(2, launchBuffer, strlen(launchBuffer));
 }
+
+
+
+/****************************************
+ *                                      *
+ *           TESTER                     *
+ *                                      *
+ ****************************************/
+
+
+
+//test all the ways to interpolate vars: $var, ---$var, ---$var---, asdas$var$anothervar$another
