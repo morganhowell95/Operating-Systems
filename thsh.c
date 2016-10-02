@@ -7,8 +7,7 @@
 //notes to self
 /*
 1. test the ins and outs of grep
-2. quotation and more precise argument parsing
-3. for some reason your debugger prints the command twice
+2. make sure that internal commands can mix and pipe in with regular commands
 */
 
 #include <stdio.h>
@@ -28,9 +27,6 @@
 #include <fcntl.h>
 // Assume no input line will be longer than 1024 bytes
 #define MAX_INPUT 1024
-// Every command can contain at most 512 embedded environment variables: len($1$2$3....$n) =1024
-// 512 = 1024/2 ->
-#define MAX_GROUPS 512
 
 //reserved internal commands (priority over external commands if overlap exists)
 enum INTERNAL_CMD {
@@ -56,7 +52,6 @@ static char* SET_ENV_PATTERN = "^([a-zA-Z0-9]+|[!@#\\$?%\\^\\&*\\)\\(+._-])\\=";
 static char* EMBEDDED_VAR = "\\$([a-zA-Z0-9]+|[!@#\\$?%\\^\\&*\\)\\(+._-])";
 static regex_t setReg;
 static regex_t embeddedVar;
-regmatch_t embedGroups[MAX_GROUPS];
 static int regexCompileStatus;
 static int processCount;
 
@@ -135,6 +130,8 @@ struct Payload** parsePayloads(struct Debugger *debug, char *tokenizedString);
 int spawnProcesses(struct Payload ***ProcessContainer, struct Navigation *nav, struct Debugger *debug);
 int spawnChild(int in, int out, struct Payload *Proc, struct Navigation *nav, struct Debugger *debug);
 int execInternal(struct Payload *Proc, struct Navigation *nav, struct Debugger *debug);
+char* cutComments(char *cmd);
+int containsComments(char *cmd);
 
 int main (int argc, char **argv, char **envp) {
     int finished = 0;
@@ -187,8 +184,6 @@ int main (int argc, char **argv, char **envp) {
             break;
         }
 
-        // Execute the command, handling built-in commands separately 
-        // Just echo the command line for now
         execute(cmd, &nav, &debug);
     }
 
@@ -222,28 +217,29 @@ int spawnProcesses(struct Payload ***ProcessContainer, struct Navigation *nav, s
     //the last process will receive output from the previous process and retain STDOUT=1
     struct Payload *LastProc = Processes[currentPipe];
     //printProcess(*LastProc);
-    if(in != 0 && !LastProc->hasRedirectIn) {
-        dup2(in, 0);
-        close(in);
-    } else if(LastProc->hasRedirectIn) {
-        in = open(LastProc->redirectIn, O_RDONLY);
-        if(in < 0) {
-            return 1;
-        } else {
-            dup2(in, 0);
-            close(in);
-        }
-    }
-    if(LastProc->hasRedirectOut) {
-        out = open(LastProc->redirectOut, O_WRONLY | O_TRUNC | O_CREAT, S_IRUSR | S_IRGRP | S_IWGRP | S_IWUSR); 
-        dup2(out, 1);
-        close(out);
-    }
+    // if(in != 0 ) { //&& !LastProc->hasRedirectIn) {
+    //     dup2(in, 0);
+    //     close(in);
+    // }
+    // } else if(LastProc->hasRedirectIn) {
+    //     in = open(LastProc->redirectIn, O_RDONLY);
+    //     if(in < 0) {
+    //         return 1;
+    //     } else {
+    //         dup2(in, 0);
+    //         close(in);
+    //     }
+    // }
+    // if(LastProc->hasRedirectOut) {
+    //     out = open(LastProc->redirectOut, O_WRONLY | O_TRUNC | O_CREAT, S_IRUSR | S_IRGRP | S_IWGRP | S_IWUSR); 
+    //     dup2(out, 1);
+    //     close(out);
+    // }
     
     if(LastProc->isInternal) {
-        exitStatus = execInternal(LastProc, nav, debug);
+        exitStatus |= execInternal(LastProc, nav, debug);
     } else {
-        exitStatus = spawnChild(in, out, LastProc, nav, debug);
+        exitStatus |= spawnChild(in, out, LastProc, nav, debug);
     } 
 
     return exitStatus;
@@ -255,7 +251,7 @@ int spawnChild(int in, int out, struct Payload *Proc, struct Navigation *nav, st
     pid = fork();
 
     if(pid < 0) {
-        exitStatus = -1;
+        exitStatus |= -1;
     }
     //successful spawning of child process, take into account proper redirects and current pipe statuses
     if (pid == 0) {
@@ -306,7 +302,7 @@ int spawnChild(int in, int out, struct Payload *Proc, struct Navigation *nav, st
     }
     //forking failed, report the failure
     else if (pid < 0) {
-        exitStatus = -1;
+        exitStatus |= -1;
 
     }
     //filtering parent process through this branch, parent waits for child to complete
@@ -315,11 +311,11 @@ int spawnChild(int in, int out, struct Payload *Proc, struct Navigation *nav, st
         pid_t childExit = waitpid (pid, &exitStatus, 0); 
 
         if (childExit != pid) {
-            exitStatus = -1;
+            exitStatus |= -1;
         }
 
         if(Proc->isInternal) {
-            exitStatus = execInternal(Proc, nav, debug);
+            exitStatus |= execInternal(Proc, nav, debug);
         }
 
     }
@@ -345,9 +341,15 @@ int execInternal(struct Payload *Proc, struct Navigation *nav, struct Debugger *
     return exitStatus;
 }
 
+void flushAndResetMain() {
+    fflush(stdin);
+    fflush(stdout);
+}
+
 void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
     //preprocess the command string to interpolate environment variables and format piping/redirection
     cmd = preprocess(cmd);
+    
     char *tokenizedString = malloc(MAX_INPUT+1);
     strcpy(tokenizedString, cmd);
 
@@ -355,14 +357,17 @@ void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
     struct Payload **Processes = parsePayloads(debug, tokenizedString);
     int num;
 
-    for(num=0;num<processCount;num++){    
-        struct Payload *sample = Processes[num];
-        //write(1, sample->arguments[1], strlen(sample->arguments[1]));
-        printProcess(*sample);
-    }
-    
+    // for(num=0;num<processCount;num++){    
+    //     struct Payload *sample = Processes[num];
+    //     //write(1, sample->arguments[1], strlen(sample->arguments[1]));
+    //     printProcess(*sample);
+    // }
+    // printf("\n*************************\n");
     int exitCode = spawnProcesses(&Processes, nav, debug);
+    //ensure that our standard streams are open and clear
+    flushAndResetMain();
     checkExitCode(exitCode, debug);
+
 
 /*
     int numProcesses = 0;
@@ -534,7 +539,7 @@ struct Payload scrapeArguments(char **token, const char *delimiters, char* parse
     struct Payload Args;
     char **arguments;
     arguments = NULL;
-    int argumentCount = 0;
+    int argls -all | catumentCount = 0;
     
     while(*token != NULL && isArgument(*token)) {
         argumentCount++;
@@ -548,7 +553,7 @@ struct Payload scrapeArguments(char **token, const char *delimiters, char* parse
         arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1);
         arguments[argumentCount-1] = *token;
         *token = strtok_r(NULL, delimiters, &parserState);
-    }
+    }ls -all | cat
 
     Args.arguments = arguments;
     Args.argumentCount = argumentCount;
@@ -556,9 +561,43 @@ struct Payload scrapeArguments(char **token, const char *delimiters, char* parse
 }*/
 
 char* preprocess(char *cmd) {
-    cmd = interpolate(cmd);
-    cmd = sanitizeRedirectsAndPipes(cmd);
-    return cmd;
+    char* noComments = cutComments(cmd);
+    printf("\n%s\n", noComments);
+    exit(0);
+    char* interpolated = interpolate(noComments);    
+    char* pipeSafe = sanitizeRedirectsAndPipes(interpolated);
+    //free buffers that will no longer be used
+    
+    if(containsComments(cmd) != -1) {
+        free(noComments);
+    }
+    if(isSpecialRedirect(cmd)) {
+        free(interpolated);
+    }
+    return pipeSafe;
+}
+
+//return string without comments
+char* cutComments(char *cmd) {
+    int firstCommentOccurrence = containsComments(cmd);
+    if(cmd == NULL || strlen(cmd) == 0 || firstCommentOccurrence == -1) {
+        return cmd;
+    } else {
+        char *buffer = malloc(MAX_INPUT);
+        strncpy(buffer, cmd, firstCommentOccurrence);
+        return buffer;
+    }
+}
+
+//return first occurrence of a comment, otherwise return -1
+int containsComments(char *cmd) {
+    int i; 
+    for(i=0; i<strlen(cmd)+1; i++) {
+        if(cmd[i] == '#') {
+            return i;
+        }
+    }
+    return -1;
 }
 
 char* sanitizeRedirectsAndPipes(char *cmd) {
@@ -608,7 +647,6 @@ char* sanitizeRedirectsAndPipes(char *cmd) {
                 bufferTick++;
             }
         }
-        //free(cmd);
         reverse(&buffer);
         return buffer;
     }
@@ -672,6 +710,51 @@ char* scrapeFile(char **token, const char *delimiters, char **parserState) {
     return filePath;
 }
 
+//return true if the supplied string starts with a quote
+int startsWithQuote(char* token) {
+    if(token != NULL) {
+        return token[0] == '\'' || token[0] == '\"';
+    }
+    return 0;
+}
+
+//precondition: the string token starts with a quote
+void atomsizeWithQuote(char **token, char** parserState, const char *delimiters, struct Payload **Process, int argc) {
+    int isInitialized = 0;
+    int argSize = 0;
+    //remove quote
+    (*token)++;
+
+    while(*token != NULL) {
+        //this argument space must dynamically resize to the number of tokens within the quote
+        if(!isInitialized) {
+            (*Process)->arguments[argc-1] = (char *) malloc(strlen(*token)+2); 
+            isInitialized = 1;
+        } else {
+            char *current = realloc((*Process)->arguments[argc-1], 
+                            strlen((*Process)->arguments[argc-1]) + strlen(*token)+2);
+            (*Process)->arguments[argc-1] = current;
+        }
+
+        int tokenTick;
+        for(tokenTick=0; tokenTick<strlen(*token); tokenTick++) {
+            if((*token)[tokenTick] != '\'' && (*token)[tokenTick] != '\"') {
+                (*Process)->arguments[argc-1][argSize] = (*token)[tokenTick];
+                argSize++;
+            } else {
+                *token = strtok_r(NULL, delimiters, parserState);
+                return;
+            }
+        } 
+        //add white space after tokens and before ending quote, because these were the original delimiter
+        (*Process)->arguments[argc-1][argSize] = ' ';
+        argSize++;   
+        (*Process)->arguments[argc-1][argSize+1] = '\0';
+        *token = strtok_r(NULL, delimiters, parserState);   
+    }
+    (*Process)->arguments[argc-1][argSize] = '\0';
+}
+
 //scrape the arguments that directly follow a particular recognized command
 void scrapeProcessArguments(struct Payload **Process, char *absoluteFilePath, const char *delimiters, 
         char** token, char** parserState) {
@@ -683,13 +766,24 @@ void scrapeProcessArguments(struct Payload **Process, char *absoluteFilePath, co
     //*arguments = (char *) malloc(strlen(absoluteFilePath+1));
     (*Process)->arguments[0] = (char *) malloc(strlen(absoluteFilePath)+1);
     strcpy((*Process)->arguments[0], absoluteFilePath);
-    
+
+
+
+    int hasQuotes = startsWithQuote(*token);
     //scrape arguments that should be associated with the command
     while(*token != NULL && isArgument(*token)) {
-        argumentCount++;
-        (*Process)->arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1); 
-        strcpy((*Process)->arguments[argumentCount-1], *token);
-        *token = strtok_r(NULL, delimiters, parserState);
+            if(!hasQuotes) {
+                //accumulating string and disregard quotes
+                argumentCount++;
+                (*Process)->arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1); 
+                strcpy((*Process)->arguments[argumentCount-1], *token);
+                *token = strtok_r(NULL, delimiters, parserState);
+            //assuming that all entities that start with a quote should be atomic and have an ending quote
+            } else {
+                argumentCount++;
+                atomsizeWithQuote(token, parserState, delimiters, Process, argumentCount);
+                hasQuotes = startsWithQuote(*token);
+            }
     }   
 
     //scrape all the redirects associated with this command
@@ -703,23 +797,27 @@ void scrapeProcessArguments(struct Payload **Process, char *absoluteFilePath, co
     (*Process)->arguments[argumentCount-1] = (char *) malloc(sizeof(NULL));
     (*Process)->arguments[argumentCount-1] = NULL;
     (*Process)->argumentCount = argumentCount;
+    //TODO: here no args were lost
 }
 
 //intialize a null process
 void initProcess(struct Payload **process) {
   //(*process)->arguments = (char **) malloc(sizeof(char **));
-  (*process)->argumentCount = 0;
-  (*process)->hasRedirectIn = 0;
-  (*process)->hasRedirectOut= 0;
-  (*process)->hasPipeAhead = 0;
-  (*process)->hasPipeBehind = 0;
-  (*process)->isInternal = 0;
-  //(*process)->redirectIn = (char *) malloc(sizeof(char *));
-  //(*process)->redirectIn = "";
-  //(*process)->redirectOut = (char *) malloc(sizeof(char *));
-  //(*process)->redirectOut = "";
-  (*process)->redirectInFD = 0;
-  (*process)->redirectOutFD = 0;
+    //memset((*process)->cmd, '\0', 254);
+    (*process)->argumentCount = 0;
+    (*process)->hasRedirectIn = 0;
+    (*process)->hasRedirectOut= 0;
+    (*process)->hasPipeAhead = 0;
+    (*process)->hasPipeBehind = 0;
+    (*process)->isInternal = 0;
+    //(*process)->redirectIn = (char *) malloc(sizeof(char *));
+    //(*process)->redirectIn = "";
+    //(*process)->redirectOut = (char *) malloc(sizeof(char *));
+    //(*process)->redirectOut = "";
+    //memset((*process)->redirectIn, '\0', 254);
+    //memset((*process)->redirectOut, '\0', 254);
+    (*process)->redirectInFD = 0;
+    (*process)->redirectOutFD = 0;
 }
 
 //given the user's inputted string, parse out all of the contents as a list of separate 
@@ -734,9 +832,11 @@ struct Payload** parsePayloads(struct Debugger *debug, char *tokenizedString) {
 
     //format each command into a payload and aggregate
     while(token != NULL) {
+        //make room for the new process in the container of processes
+        Processes[numberOfProcesses-1] = malloc(sizeof(struct Payload));
         struct Payload *Process = Processes[numberOfProcesses-1];
-        Process = (struct Payload*) malloc(sizeof(struct Payload *));
         initProcess(&Process);
+
         memset(Process->cmd, '\0', strlen(Process->cmd));
         strcpy(Process->cmd, token);
         //maintain debugging info with both successful and failed command attempts
@@ -753,9 +853,13 @@ struct Payload** parsePayloads(struct Debugger *debug, char *tokenizedString) {
 
         token = strtok_r(NULL, delimiters, &parserState);
         scrapeProcessArguments(&Process, Process->cmd, delimiters, &token, &parserState);
+
         Processes[numberOfProcesses-1] = Process;
         numberOfProcesses++;
-        Processes = (struct Payload**) realloc(Processes, (numberOfProcesses * sizeof(struct Payload **))+1);
+        struct Payload **ProcessesCopy = (struct Payload**) realloc(Processes, (numberOfProcesses * sizeof( struct Payload** )));
+        if(ProcessesCopy != NULL) {
+            Processes = ProcessesCopy;
+        }
     }
     processCount = numberOfProcesses-1;
     return Processes;
@@ -800,10 +904,11 @@ int formatExternalCommand(struct Payload **Process, char *token) {
         }
 }
 char* interpolate(char *token) {
-    if(token == NULL || strlen(token) == 0 || hasVar(token) == -1) {
+    if(token == NULL || strlen(token) == 0 || !hasVar(token)) {
+        printf("wtf");
         return token;
     } else {
-
+        printf("here");
         char *buffer = malloc(MAX_INPUT);
         char *interpolatedVar = malloc(MAX_INPUT); 
         int tokenTick, bufferTick = 0, varTick = 0;
@@ -867,15 +972,15 @@ void print(int num, ...) {
     write(1, prntStr, strlen(prntStr));
 }*/
 
-//return index of the first embedded variabled, denoted by $
+//return true if the token contains a variable
 int hasVar(char *token) {
     int i;
     for(i=0; i<strlen(token); i++) {
         if(token[i] == '$') {
-            return i;
+            return 1;
         }
     }
-    return -1;
+    return 0;
 }
 
 //attempt to find a binary executable within the paths provided, returning NULL if file is not found
@@ -1117,10 +1222,18 @@ void checkExitCode(int code, struct Debugger *debug) {
 void printProcess(struct Payload Process) {
         printf("\n-------------------\n");
         printf("process name %s\n", Process.cmd);
-        printf("process arguments %s\n", Process.arguments[1]);
+        //printf("process arguments %s\n", Process.arguments[1]);
+        printf("process arguments: \n");
+        int i;
+        for(i=0;i <Process.argumentCount; i++) {
+            printf("argument%d: %s\n", i, Process.arguments[i]);
+        }
+
         if(Process.hasRedirectIn) {
             printf("input file %s\n", Process.redirectIn);
         }
+
+
         if(Process.hasRedirectOut) {
             printf("output file %s\n", Process.redirectOut);
         }
