@@ -24,7 +24,8 @@
 #include <time.h>
 #include <regex.h>
 #include <stdarg.h>
-
+#include <sys/types.h>
+#include <fcntl.h>
 // Assume no input line will be longer than 1024 bytes
 #define MAX_INPUT 1024
 // Every command can contain at most 512 embedded environment variables: len($1$2$3....$n) =1024
@@ -38,7 +39,11 @@ enum INTERNAL_CMD {
 static const char *CMD_MAPPING[] = {
     "nil", "exit", "cd", "goheels", "set"
 };
-static const char REDIRECTS[] = {'|', '>', '<',};
+enum REDIRECT {
+    PIPE=0, IN=1, OUT=2, 
+};
+
+static const char REDIRECTS[] = {'|', '<', '>',};
 
 //goheels' ascii art file name
 static char *HEEL_ART = "HeelArt.art";
@@ -53,11 +58,23 @@ static regex_t setReg;
 static regex_t embeddedVar;
 regmatch_t embedGroups[MAX_GROUPS];
 static int regexCompileStatus;
+static int processCount;
 
 //wrapper for parsed arguments
 struct Payload {
-    char **arguments;
+    char cmd[MAX_INPUT];
+    char *arguments[MAX_INPUT];
     int argumentCount;
+    int hasRedirectIn;
+    int hasRedirectOut;
+    int hasPipeAhead;
+    int hasPipeBehind;
+    int isInternal;
+    char redirectIn[MAX_INPUT];
+    char redirectOut[MAX_INPUT];
+    //file descriptors for redirected output and inputs
+    int redirectInFD;
+    int redirectOutFD;
 };
 
 //wrapper for live cwd and history feedback
@@ -89,10 +106,10 @@ int isAbsoluteOrRelativePath(char *path);
 char* findBinary(char *path, char *fileName);
 char* concat(char *s1, char *s2);
 int isXFile(char* file);
-struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimiters, char **token, char* parserState);
+//struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimiters, char **token, char* parserState);
 int isArgument(char *arg);
 int isSpecialRedirect(char *arg);
-struct Payload scrapeArguments(char **token, const char *delimiters, char* parserState);
+//struct Payload scrapeArguments(char **token, const char *delimiters, char* parserState);
 int isDirectory(char *path);
 int changeDirectory(struct Payload Args, struct Navigation *nav);
 int isFile(char *file);
@@ -107,9 +124,21 @@ char** parseEnvVar(char *arg);
 void reverse(char **var);
 char* interpolate(char *token);
 int hasVar(char *token);
+char* sanitizeRedirectsAndPipes(char *cmd);
+int formatExternalCommand(struct Payload **Process, char *token);
+struct Payload scrapeArguments(char *absoluteFilePath, const char *delimiters, char** token, char* parserState);
+char* scrapeFile(char **token, const char *delimiters, char **parserState);
+int filterRedirectsAndPipes(struct Payload **Process, const char *delimiters, char **token, char **parserState);
+char* preprocess(char *cmd);
+void printProcess(struct Payload Process);
+struct Payload** parsePayloads(struct Debugger *debug, char *tokenizedString);
+int spawnProcesses(struct Payload ***ProcessContainer, struct Navigation *nav, struct Debugger *debug);
+int spawnChild(int in, int out, struct Payload *Proc, struct Navigation *nav, struct Debugger *debug);
+int execInternal(struct Payload *Proc, struct Navigation *nav, struct Debugger *debug);
 
 int main (int argc, char **argv, char **envp) {
     int finished = 0;
+    processCount = 0;
     char prompt[MAX_INPUT];
     char cmd[MAX_INPUT];
 
@@ -127,10 +156,6 @@ int main (int argc, char **argv, char **envp) {
     //precompile regexs for optimized pattern matching (for parsing environment variables)
     regexCompileStatus = regcomp(&setReg, SET_ENV_PATTERN, 1);
     regexCompileStatus = regcomp(&embeddedVar, EMBEDDED_VAR, 1);
-    if(regexCompileStatus) {
-        printf("fuck");
-        exit(3);
-    }
 
     while (!finished) {
         char *cursor;
@@ -170,27 +195,197 @@ int main (int argc, char **argv, char **envp) {
     return 0;
 }
 
+//spawn and pipe together (where indicated) all processes 
+//taking note that the first process will always take input from STDIN=0 and the last
+//process will always write to STDOUT=1 unless a redirect is included
+int spawnProcesses(struct Payload ***ProcessContainer, struct Navigation *nav, struct Debugger *debug) {
+    struct Payload **Processes = *ProcessContainer;
+    int fd[2];
+    int currentPipe;
+    int in = 0;
+    int out = 1;
+    int exitStatus = 0; 
+
+    for(currentPipe=0; currentPipe<processCount-1;  currentPipe++) {
+        //initialize new file descriptors
+        pipe(fd);
+
+        exitStatus = spawnChild(in, fd[1], Processes[currentPipe], nav, debug);
+        
+        //child process kicked off above will write to this FD
+        close(fd[1]);
+
+        //the next process will take input that the previous process wrote to
+        in = fd[0];
+    }
+
+    //the last process will receive output from the previous process and retain STDOUT=1
+    struct Payload *LastProc = Processes[currentPipe];
+    //printProcess(*LastProc);
+    if(in != 0 && !LastProc->hasRedirectIn) {
+        dup2(in, 0);
+        close(in);
+    } else if(LastProc->hasRedirectIn) {
+        in = open(LastProc->redirectIn, O_RDONLY);
+        if(in < 0) {
+            return 1;
+        } else {
+            dup2(in, 0);
+            close(in);
+        }
+    }
+    if(LastProc->hasRedirectOut) {
+        out = open(LastProc->redirectOut, O_WRONLY | O_TRUNC | O_CREAT, S_IRUSR | S_IRGRP | S_IWGRP | S_IWUSR); 
+        dup2(out, 1);
+        close(out);
+    }
+    
+    if(LastProc->isInternal) {
+        exitStatus = execInternal(LastProc, nav, debug);
+    } else {
+        exitStatus = spawnChild(in, out, LastProc, nav, debug);
+    } 
+
+    return exitStatus;
+}
+
+int spawnChild(int in, int out, struct Payload *Proc, struct Navigation *nav, struct Debugger *debug) {
+    int exitStatus = 0;
+    pid_t pid;
+    pid = fork();
+
+    if(pid < 0) {
+        exitStatus = -1;
+    }
+    //successful spawning of child process, take into account proper redirects and current pipe statuses
+    if (pid == 0) {
+        //link the proper redirect files
+        if(Proc->hasRedirectIn) {
+            in = open(Proc->redirectIn, O_RDONLY);
+            //accessing this file failed
+            if(in < 0) {
+                write(1, "File does not exists", 20);
+                return 1;
+            } else {
+                dup2(in, 0);
+                close(in);
+            }
+        //Just as the standard Bash implementation, redirects have priority over pipes
+        } else {
+            if (in != 0) {
+                dup2(in, 0);
+                close(in);
+            }
+        }
+
+        if(Proc->hasRedirectOut) {
+            out = open(Proc->redirectOut, O_WRONLY | O_TRUNC | O_CREAT, S_IRUSR | S_IRGRP | S_IWGRP | S_IWUSR);
+            if(out < 0) {
+                write(1, "File could not be opened", 24);
+                return 1;
+            } else {
+                dup2(out, 1);
+                close(out);
+            }
+        } else {
+            if(out != 1) {
+                dup2(out, 1);
+                close(out);
+            }
+
+        }
+
+        //commands that are internal should bubble up to the parent process
+        if(!Proc->isInternal) {
+            execv(Proc->cmd, Proc->arguments);
+        } else {
+            return 0;
+        }
+        
+        _exit (EXIT_FAILURE);
+    }
+    //forking failed, report the failure
+    else if (pid < 0) {
+        exitStatus = -1;
+
+    }
+    //filtering parent process through this branch, parent waits for child to complete
+    else {
+
+        pid_t childExit = waitpid (pid, &exitStatus, 0); 
+
+        if (childExit != pid) {
+            exitStatus = -1;
+        }
+
+        if(Proc->isInternal) {
+            exitStatus = execInternal(Proc, nav, debug);
+        }
+
+    }
+    return exitStatus;
+}
+
+int execInternal(struct Payload *Proc, struct Navigation *nav, struct Debugger *debug) {
+    int exitStatus = 0;
+    switch(Proc->isInternal) {
+        case EXIT:
+            exit(0);
+            break;
+        case CD:
+            exitStatus = changeDirectory(*Proc, nav);
+            break;
+        case GOHEELS:
+            exitStatus = buildHeelArt(nav, debug);
+            break;
+        case SET:
+            exitStatus = setEnvVar(nav, debug, Proc);
+            break;
+    }
+    return exitStatus;
+}
+
 void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
-    const char *delimiters = " \n\r\t";
+    //preprocess the command string to interpolate environment variables and format piping/redirection
+    cmd = preprocess(cmd);
     char *tokenizedString = malloc(MAX_INPUT+1);
     strcpy(tokenizedString, cmd);
-    char *parserState;
-    char *token = strtok_r(tokenizedString, delimiters, &parserState);
-    //interpolation calls preprocess the token for potentially embedded environment variables
-    token = interpolate(token);
-    int isInternal = isInternalCommand(token);
-    //maintain debugging info with both successful and failed command attempts
-    if(DEBUG_MODE) updateAndLogLaunch(debug, token);
 
+    //parse all the provided commands, redirects, and pipes as a collection of Payloads
+    struct Payload **Processes = parsePayloads(debug, tokenizedString);
+    int num;
+
+    for(num=0;num<processCount;num++){    
+        struct Payload *sample = Processes[num];
+        //write(1, sample->arguments[1], strlen(sample->arguments[1]));
+        printProcess(*sample);
+    }
+    
+    int exitCode = spawnProcesses(&Processes, nav, debug);
+    checkExitCode(exitCode, debug);
+
+/*
+    int numProcesses = 0;
+    struct Payload *Process = Processes[0];
+    while(Process != NULL) {
+        numProcesses++;
+        Process = Processes[numProcesses];
+    }
+
+    printf("%d", numProcesses);
+    exit(3);
+
+  */  
+    
+    /*
     while(token != NULL) {
         //check to see if the provided command is an internal command
-        if(isInternal) {
+        if(Process.isInternal) {
             token = strtok_r(NULL, delimiters, &parserState);
-            token = interpolate(token);
             struct Payload Args = scrapeArguments(&token, delimiters, parserState);
             int responseCode = 0;
 
-            switch(isInternal) {
+            switch(Process.isInternal) {
                 case EXIT:
                     exit(3);
                     break;
@@ -207,41 +402,14 @@ void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
             checkExitCode(responseCode, debug);
         //if the provided command is not internal, we begin our search in the path provided or $PATH
         } else { 
-            char *pathAttempts;
-            char *absoluteFilePath;
-            int responseCode;
 
-            //attempt a search in $PATH environment variable    
-            if(!isAbsoluteOrRelativePath(token)) {
-                pathAttempts = getenv("PATH");
-                char *file = concat("/", token);
-                absoluteFilePath = findBinary(pathAttempts, file);
-                free(file);
-            //search for binary in provided path
-            } else {
-                pathAttempts = concat(token, ":");
-                absoluteFilePath = findBinary(pathAttempts, "");
-                free(pathAttempts);
-            }
+            //kick off process spawning, with respect to piping and redirects
+            
 
-            if(absoluteFilePath != NULL) {
-                token = strtok_r(NULL, delimiters, &parserState);
-                token = interpolate(token);
-                struct Payload Args = scrapeProcessArguments(absoluteFilePath, delimiters, &token, parserState);
-                responseCode = spawnProcess(absoluteFilePath, Args);
-                free(Args.arguments);
-            } else {
-                char *noCommand = concat(token, ": command could not be found\n");
-                write(1, noCommand, strlen(noCommand));
-                free(noCommand);
-                token = strtok_r(NULL, delimiters, &parserState);
-                token = interpolate(token);
-                responseCode = -1;
-            }
             checkExitCode(responseCode, debug);
         }
     }
-    free(tokenizedString);
+    free(tokenizedString);*/
 }
 
 
@@ -327,11 +495,14 @@ char *getCurrentTime() {
 }
 
 //kick off new child process with the provided payload (arguments)
-int spawnProcess(char *path, struct Payload Args)
-{
-    int status;
+int spawnProcess(char *path, struct Payload Args) {
+    int exitStatus;
     pid_t pid;
     pid = fork();
+
+    if(pid < 0) {
+        exitStatus = -1;
+    }
     //successful spawning of child process
     if (pid == 0) {
         execv(path, Args.arguments);
@@ -339,16 +510,16 @@ int spawnProcess(char *path, struct Payload Args)
     }
     //forking failed, report the failure
     else if (pid < 0) {
-        status = -1;
+        exitStatus = -1;
     }
     //filtering parent process through this branch, parent waits for child to complete
     else {
-        if (waitpid (pid, &status, 0) != pid) {
-            status = -1;
+        if (waitpid (pid, &exitStatus, 0) != pid) {
+            exitStatus = -1;
         }
     }
     
-    return status;
+    return exitStatus;
 }
 
 
@@ -358,36 +529,7 @@ int spawnProcess(char *path, struct Payload Args)
  *                                      *
  ****************************************/
 
-//scrape the arguments that directly follow a particular recognized command
-struct Payload scrapeProcessArguments(char *absoluteFilePath, const char *delimiters, char** token, char* parserState) {
-    //when passing arguments to execv, we must include file descriptor name and an ending NULL terminator 
-    struct Payload Args;
-    unsigned long currentArgumentSize = 0;
-    int argumentCount = 1;
-    char** arguments;
-    arguments = (char **) malloc(argumentCount * sizeof(char *));
-    *arguments = (char *) malloc(strlen(absoluteFilePath+1));
-    arguments[0] = absoluteFilePath;
-
-    while(*token != NULL && isArgument(*token)) {
-        argumentCount++;
-        arguments = (char **) realloc(arguments, argumentCount * sizeof(char *));
-        arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1); 
-        arguments[argumentCount-1] = *token;
-        *token = strtok_r(NULL, delimiters, &parserState);
-        *token = interpolate(*token);
-    }
-
-    argumentCount++;
-    arguments = (char **) realloc(arguments, argumentCount * sizeof(char *));
-    arguments[argumentCount-1] = (char *) malloc(1);
-    arguments[argumentCount-1] = NULL;
-    Args.arguments = arguments;
-    Args.argumentCount = argumentCount;
-    return Args;
-}
-
-
+/*
 struct Payload scrapeArguments(char **token, const char *delimiters, char* parserState) {
     struct Payload Args;
     char **arguments;
@@ -406,14 +548,257 @@ struct Payload scrapeArguments(char **token, const char *delimiters, char* parse
         arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1);
         arguments[argumentCount-1] = *token;
         *token = strtok_r(NULL, delimiters, &parserState);
-        *token = interpolate(*token);
     }
 
     Args.arguments = arguments;
     Args.argumentCount = argumentCount;
     return Args;
+}*/
+
+char* preprocess(char *cmd) {
+    cmd = interpolate(cmd);
+    cmd = sanitizeRedirectsAndPipes(cmd);
+    return cmd;
 }
 
+char* sanitizeRedirectsAndPipes(char *cmd) {
+    if(cmd == NULL || strlen(cmd) == 0 || !isSpecialRedirect(cmd)) {
+        return cmd;
+    } else {
+        char *buffer = malloc(MAX_INPUT);
+        int i;
+        int j;
+        int bufferTick = 0;
+
+        //scan backwards to expand and isolate redirects
+        for(i=strlen(cmd)-1;i>=0;i--) {
+            int redirectDetected = 0;
+            for(j=0;j<sizeof(REDIRECTS); j++) {
+                if(cmd[i] == REDIRECTS[j]) {
+                    redirectDetected = 1;
+                    break;
+                }
+            }
+
+            if(redirectDetected) {
+                //add space to create expansion (if necessary)
+                if(i+1<strlen(cmd) && cmd[i+1] != ' ' && cmd[i+1] != '\t') {
+                    buffer[bufferTick] = ' ';
+                    bufferTick++;
+                }
+
+                //add redirect component
+                buffer[bufferTick] = REDIRECTS[j];
+                bufferTick++;
+
+                //isolate redirect component
+                while(i-1>=0 && cmd[i-1] >= '0'&& cmd[i-1] <= '9') {
+                    buffer[bufferTick] = cmd[i-1];
+                    bufferTick++;
+                    i--;
+                }
+
+                //add space past the isolate for full expansion (if necessary)
+                if(i-1>=0 && cmd[i-1] != ' ' && cmd[i-1] != '\t') {
+                    buffer[bufferTick] = ' ';
+                    bufferTick++;
+                }
+            } else {
+                buffer[bufferTick] = cmd[i];
+                bufferTick++;
+            }
+        }
+        //free(cmd);
+        reverse(&buffer);
+        return buffer;
+    }
+}
+
+
+// //scrape the arguments that directly follow a particular recognized command
+// struct Payload scrapeArguments(char *absoluteFilePath, const char *delimiters, char** token, char* parserState) {
+//     //when passing arguments to execv, we must include file descriptor name and an ending NULL terminator 
+//     struct Payload Args;
+//     unsigned long currentArgumentSize = 0;
+//     int argumentCount = 1;
+//     char** arguments;
+//     arguments = (char **) malloc(argumentCount * sizeof(char *));
+//     *arguments = (char *) malloc(strlen(absoluteFilePath+1));
+//     arguments[0] = absoluteFilePath;
+
+//     while(*token != NULL && isArgument(*token)) {
+//         argumentCount++;
+//         arguments = (char **) realloc(arguments, argumentCount * sizeof(char *));
+//         arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1); 
+//         arguments[argumentCount-1] = *token;
+//         *token = strtok_r(NULL, delimiters, &parserState);
+//     }
+
+//     argumentCount++;
+//     arguments = (char **) realloc(arguments, argumentCount * sizeof(char *));
+//     arguments[argumentCount-1] = (char *) malloc(1);
+//     arguments[argumentCount-1] = NULL;
+//     Args.arguments = arguments;
+//     Args.argumentCount = argumentCount;
+//     return Args;
+// }
+
+int filterRedirectsAndPipes(struct Payload **Process, const char *delimiters, char **token, char **parserState) {
+    char *file;
+    switch(*token[strlen(*token)-1]) {
+        case '|':
+            (*Process)->hasPipeAhead = 1;
+            return 1;
+            break;
+        case '<':
+            (*Process)->hasRedirectIn = 1;
+            file = scrapeFile(token, delimiters, parserState);
+            strcpy((*Process)->redirectIn, file);
+            break;
+
+        case '>':
+            (*Process)->hasRedirectOut = 1;
+            file = scrapeFile(token, delimiters, parserState);
+            strcpy((*Process)->redirectOut,file);
+            break;
+    }
+    return 0;
+}
+
+char* scrapeFile(char **token, const char *delimiters, char **parserState) {
+    *token = strtok_r(NULL, delimiters, parserState);
+    char *filePath = malloc(sizeof(*token));
+    strcpy(filePath, *token);
+    return filePath;
+}
+
+//scrape the arguments that directly follow a particular recognized command
+void scrapeProcessArguments(struct Payload **Process, char *absoluteFilePath, const char *delimiters, 
+        char** token, char** parserState) {
+    //when passing arguments to execv, we must include file descriptor name and an ending NULL terminator 
+    //unsigned long currentArgumentSize = 0;
+    int argumentCount = 1;
+    //char* arguments[MAX_INPUT];
+    //arguments = (char **) malloc(argumentCount * sizeof(char *));
+    //*arguments = (char *) malloc(strlen(absoluteFilePath+1));
+    (*Process)->arguments[0] = (char *) malloc(strlen(absoluteFilePath)+1);
+    strcpy((*Process)->arguments[0], absoluteFilePath);
+    
+    //scrape arguments that should be associated with the command
+    while(*token != NULL && isArgument(*token)) {
+        argumentCount++;
+        (*Process)->arguments[argumentCount-1] = (char *) malloc(strlen(*token)+1); 
+        strcpy((*Process)->arguments[argumentCount-1], *token);
+        *token = strtok_r(NULL, delimiters, parserState);
+    }   
+
+    //scrape all the redirects associated with this command
+    int encounteredPipe = 0;
+    while(*token != NULL && !isArgument(*token) && !encounteredPipe) { 
+        encounteredPipe = filterRedirectsAndPipes(Process, delimiters, token, parserState);
+        *token = strtok_r(NULL, delimiters, parserState);
+    }
+
+    argumentCount++;
+    (*Process)->arguments[argumentCount-1] = (char *) malloc(sizeof(NULL));
+    (*Process)->arguments[argumentCount-1] = NULL;
+    (*Process)->argumentCount = argumentCount;
+}
+
+//intialize a null process
+void initProcess(struct Payload **process) {
+  //(*process)->arguments = (char **) malloc(sizeof(char **));
+  (*process)->argumentCount = 0;
+  (*process)->hasRedirectIn = 0;
+  (*process)->hasRedirectOut= 0;
+  (*process)->hasPipeAhead = 0;
+  (*process)->hasPipeBehind = 0;
+  (*process)->isInternal = 0;
+  //(*process)->redirectIn = (char *) malloc(sizeof(char *));
+  //(*process)->redirectIn = "";
+  //(*process)->redirectOut = (char *) malloc(sizeof(char *));
+  //(*process)->redirectOut = "";
+  (*process)->redirectInFD = 0;
+  (*process)->redirectOutFD = 0;
+}
+
+//given the user's inputted string, parse out all of the contents as a list of separate 
+//commands (Payloads) with appropriate arguments, redirects, and upcoming pipes
+struct Payload** parsePayloads(struct Debugger *debug, char *tokenizedString) {
+    struct Payload **Processes = (struct Payload **) malloc(sizeof(struct Payload **));
+    const char *delimiters = " \n\r\t";
+    char *parserState;
+    char *token = strtok_r(tokenizedString, delimiters, &parserState);
+    int numberOfProcesses = 1;
+    int exitCode;
+
+    //format each command into a payload and aggregate
+    while(token != NULL) {
+        struct Payload *Process = Processes[numberOfProcesses-1];
+        Process = (struct Payload*) malloc(sizeof(struct Payload *));
+        initProcess(&Process);
+        memset(Process->cmd, '\0', strlen(Process->cmd));
+        strcpy(Process->cmd, token);
+        //maintain debugging info with both successful and failed command attempts
+        if(DEBUG_MODE) updateAndLogLaunch(debug, Process->cmd);
+
+        Process->isInternal = isInternalCommand(Process->cmd);
+        //if command is not internal, we take the absolute path or search in $PATH to find the binary
+        if(!Process->isInternal) {
+            exitCode = formatExternalCommand(&Process, Process->cmd);
+            if(exitCode) {
+                checkExitCode(exitCode, debug);
+            }
+        }
+
+        token = strtok_r(NULL, delimiters, &parserState);
+        scrapeProcessArguments(&Process, Process->cmd, delimiters, &token, &parserState);
+        Processes[numberOfProcesses-1] = Process;
+        numberOfProcesses++;
+        Processes = (struct Payload**) realloc(Processes, (numberOfProcesses * sizeof(struct Payload **))+1);
+    }
+    processCount = numberOfProcesses-1;
+    return Processes;
+}
+
+
+//verify that payload is a valid external command, search and format if necessary
+int formatExternalCommand(struct Payload **Process, char *token) {
+        char pathAttempts[MAX_INPUT];
+        char *absoluteFilePath;
+        int responseCode;
+    
+        //attempt a search in $PATH environment variable    
+        if(!isAbsoluteOrRelativePath(token)) {
+            strcpy(pathAttempts, getenv("PATH"));
+            char file[MAX_INPUT];
+            strcpy(file, token);
+            absoluteFilePath = findBinary(pathAttempts, file);
+        //search for binary in provided path
+        } else {
+            strcpy(pathAttempts, token);
+            strcat(pathAttempts, ":");
+            absoluteFilePath = findBinary(pathAttempts, "");
+        }
+
+        if(absoluteFilePath != NULL) {
+            strcpy((*Process)->cmd, absoluteFilePath);
+            return 0;
+            //token = strtok_r(NULL, delimiter`s, &parserState);
+            //struct Payload Args = scrapeProcessArguments(absoluteFilePath, delimiters, &token, parserState);
+            //responseCode = spawnProcess(absoluteFilePath, Args);
+            //free(Args.arguments);
+        } else {
+            char noCommand[MAX_INPUT];
+            strcpy(noCommand, token);
+            strcat(noCommand, ": command could not be found\n");
+            //char *noCommand = concat(token, ": command could not be found\n");
+            write(1, noCommand, strlen(noCommand));
+            //free(noCommand);
+            //token = strtok_r(NULL, delimiters, &parserState);
+            return -1;
+        }
+}
 char* interpolate(char *token) {
     if(token == NULL || strlen(token) == 0 || hasVar(token) == -1) {
         return token;
@@ -428,7 +813,8 @@ char* interpolate(char *token) {
             if(token[tokenTick] == '$') {
                 tokenTick++;
                 //scrape the environment variable name indicated after the $
-                while(tokenTick<strlen(token) && token[tokenTick] != '$') {
+                while(tokenTick<strlen(token) && token[tokenTick] != '$' && token[tokenTick] != ' '
+                        && token[tokenTick] != '\n' && token[tokenTick] != '\t' && token[tokenTick] != '\r') {
                     interpolatedVar[varTick] = token[tokenTick];
                     tokenTick++;
                     varTick++;
@@ -461,7 +847,6 @@ char* interpolate(char *token) {
         return buffer;
     }
 }
-
 /*
 //print arbitrary strings and variables
 void print(int num, ...) {
@@ -502,14 +887,19 @@ char* findBinary(char *path, char *fileName) {
     struct stat fileStat;
 
     while(shard != NULL) {
-        char *completeFileName = concat(shard, fileName);
-        //check first to see if the file exists and executable permissions
+        char *completeFileName = malloc(strlen(shard) + strlen(fileName) + 1);
+        strcpy(completeFileName, shard);
+        strcat(completeFileName, "/");
+        strcat(completeFileName, fileName);
+        //check first to see if the file exists and we have executable permissions
         if(isXFile(completeFileName)) {
+            free(paths);
             return completeFileName;
         }
         free(completeFileName);
         shard = strtok_r(NULL, ":", &internalParserState);
     }
+    free(paths);
     //binary could not be found
     return NULL;
 }
@@ -559,13 +949,13 @@ int changeDirectory(struct Payload Args, struct Navigation *nav) {
     int responseStatus = 0;
 
     //if no arguments are specified with cd, we assume a change to the home directory
-    if(Args.argumentCount == 0 || (Args.argumentCount==1 && Args.arguments[0][0] == '~')) {
+    if(Args.argumentCount == 2 || (Args.argumentCount==3 && Args.arguments[1][0] == '~')) {
         responseStatus = chdir(getenv("HOME"));
         memset(nav->lastDirectory, '\0', MAX_INPUT);
         strcpy(nav->lastDirectory, nav->pwd);
     } else {
         char *targetDirectory;
-        targetDirectory = Args.arguments[0];
+        targetDirectory = Args.arguments[1];
         if(strlen(targetDirectory)==1 && targetDirectory[0]=='-') {
             responseStatus = chdir(nav->lastDirectory);
             memset(nav->lastDirectory, '\0', MAX_INPUT);
@@ -677,9 +1067,13 @@ int isInternalCommand(char *token) {
 void flush(char **buffer) {
     memset(*buffer, '\0', strlen(*buffer));
 }
-//set path variable for return code
+
+//update proper environment variables with most recent return code and show debugging console if enabled
 void checkExitCode(int code, struct Debugger *debug) {
     debug->exitStatus = code;
+    char exitStatus[10];
+    snprintf(exitStatus, sizeof(exitStatus),"%d", code);
+    setenv("?", exitStatus, 1);
     memset(debug->cmdEnd, '\0', 50);
     strcpy(debug->cmdEnd, getCurrentTime());
     //print the current debugger status if debugging mode is enabled
@@ -717,6 +1111,21 @@ void checkExitCode(int code, struct Debugger *debug) {
         strcat(debuggerConsole, buffer);
         write(2, debuggerConsole, strlen(debuggerConsole));
     }
+}
+
+
+void printProcess(struct Payload Process) {
+        printf("\n-------------------\n");
+        printf("process name %s\n", Process.cmd);
+        printf("process arguments %s\n", Process.arguments[1]);
+        if(Process.hasRedirectIn) {
+            printf("input file %s\n", Process.redirectIn);
+        }
+        if(Process.hasRedirectOut) {
+            printf("output file %s\n", Process.redirectOut);
+        }
+        printf("pipe ahead? %d\n", Process.hasPipeAhead);
+        printf("\n-------------------\n");
 }
 
 
