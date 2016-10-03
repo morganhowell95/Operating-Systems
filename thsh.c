@@ -47,6 +47,12 @@ static char *HEEL_ART = "HeelArt.art";
 //developer/debug mode ON=1/OFF=0
 static int DEBUG_MODE = 0;
 
+//non-interactive mode
+static int NONINTERATIVE_MODE = 0;
+
+//disable prompt for non-interactive mode by passing '-np' option
+static int DISABLE_PROMPT = 0;
+
 //constant pattern matching for valid environment variable sets
 static char* SET_ENV_PATTERN = "^([a-zA-Z0-9]+|[!@#\\$?%\\^\\&*\\)\\(+._-])\\=";
 static char* EMBEDDED_VAR = "\\$([a-zA-Z0-9]+|[!@#\\$?%\\^\\&*\\)\\(+._-])";
@@ -132,6 +138,102 @@ int spawnChild(int in, int out, struct Payload *Proc, struct Navigation *nav, st
 int execInternal(struct Payload *Proc, struct Navigation *nav, struct Debugger *debug);
 char* cutComments(char *cmd);
 int containsComments(char *cmd);
+int executeNonInteractive(char *scriptPath, struct Debugger *debug, struct Navigation *nav);
+void initProcess(struct Payload **process);
+void setNonInteractiveMode(int argCount, char **args, struct Debugger *debug, struct Navigation *nav);
+
+//scrape given arguments for the developer option
+void setDebugger(int argCount, char **args) {
+    char *optionTarget = "-d";
+    int i;
+    for(i=1;i<argCount;i++) {
+        if(strlen(args[i]) == 2 && strncmp(args[i], optionTarget, strlen(optionTarget))==0) {
+            DEBUG_MODE = 1;
+        }
+    }
+}
+
+//disable the prompt from printing to STDOUT by option "-np"
+void disablePrompt(int argCount, char **args) {
+    char *optionTarget = "-np";
+    int i;
+    for(i=1;i<argCount;i++) {
+        if(strlen(args[i]) == 3 && strncmp(args[i], optionTarget, strlen(optionTarget))==0) {
+            DISABLE_PROMPT = 1;
+        }
+    }
+}
+
+//scrape given arguments for a script to execute in non-interactive mode
+//if no script is found, thsh will execute interactive mode as normal
+void setNonInteractiveMode(int argCount, char **args, struct Debugger *debug, struct Navigation *nav) {
+    int i;
+    struct Payload *ProcessStub = malloc(sizeof(struct Payload));
+    int scriptFind = 0;
+    int endInteractiveMode = 0;
+    int executeStatus = 0;
+    for(i=1;i<argCount;i++) {
+        if(strlen(args[i]) > 0) {
+            //skip arguments that are options
+            if(args[i][0] == '-') {
+                continue;
+            } else {
+                scriptFind = formatExternalCommand(&ProcessStub, args[i]);
+                if(!scriptFind) {
+                    //if error occurs in any of the scripts, it will carry through to the parent process
+                     executeStatus |= executeNonInteractive(ProcessStub->cmd, debug, nav);
+                     endInteractiveMode = 1;
+                }
+            }
+        }
+    }
+    //if we were able to successfully find a script file and attempt to execute it, 
+    //we will end thsh
+    if(endInteractiveMode) {
+        exit(executeStatus);
+    }
+}
+
+//non-interactive mode will spawn a child process that executes the thsh binary
+int executeNonInteractive(char *scriptPath, struct Debugger *debug, struct Navigation *nav) {
+    //debugger mode will be set for all inputted files if '-d' was provided as an option
+    int findThshBinary = 0;
+    int exitVal = 0;
+    if(isFile(scriptPath)) {
+        struct Payload *ProcessStub = malloc(sizeof(struct Payload));
+        initProcess(&ProcessStub);
+        //Process container which in this case will contain one process: thsh
+        struct Payload **Processes = (struct Payload **) malloc(sizeof(struct Payload**));
+
+        //attempt to find the thsh binary, searching in $PATH and the current directory
+        findThshBinary = formatExternalCommand(&ProcessStub, "thsh");
+        if(findThshBinary) {
+            char *findError = "The thsh binary executable could not be located, please place it in the cwd or $PATH\n";
+            write(1, findError, strlen(findError));
+            return -1;
+        }
+
+        //load debugging mode as an argument if enabled
+        char *arguments[4];
+        if(DEBUG_MODE) {
+            arguments[0] = ProcessStub->cmd;
+            arguments[1] = "-d";
+            arguments[2] = "-np";
+            arguments[3] = NULL;
+        } else {
+            arguments[0] = ProcessStub->cmd;
+            arguments[1] = "-np";
+            arguments[2] = NULL;
+        }
+
+        //load the provided script as the input stream of the thsh executable
+        strcpy(ProcessStub->redirectIn, scriptPath);
+        ProcessStub->hasRedirectIn = 1;
+        *Processes = ProcessStub;
+        exitVal = spawnProcesses(&Processes, nav, debug);
+    }
+    return exitVal;
+}
 
 int main (int argc, char **argv, char **envp) {
     int finished = 0;
@@ -148,8 +250,13 @@ int main (int argc, char **argv, char **envp) {
     struct Debugger debug;
     if(argc>1) {
         setDebugger(argc, argv);
+        //if debug mode has been set, we can jump to the second argument to search for scripts to
+        //run in non-interactive mode
+        setNonInteractiveMode(argc, argv, &debug, &nav);
+        disablePrompt(argc, argv);
     }
 
+    
     //precompile regexs for optimized pattern matching (for parsing environment variables)
     regexCompileStatus = regcomp(&setReg, SET_ENV_PATTERN, 1);
     regexCompileStatus = regcomp(&embeddedVar, EMBEDDED_VAR, 1);
@@ -157,15 +264,19 @@ int main (int argc, char **argv, char **envp) {
     while (!finished) {
         char *cursor;
         char last_char;
-        int rv;
+        int rv=1;
         int count;
         
         //setting prompt with current directory prefix
         getcwd(nav.pwd, MAX_INPUT);
         memset(prompt, '\0', strlen(prompt));
         sprintf(prompt, "[%s] thsh> ", nav.pwd);
+        
+        //only print the prompt if the prompt has not been disable (prompt disable in non-interactive mode)
+        if(!DISABLE_PROMPT) {
+            rv = write(1, prompt, strlen(prompt));
+        }
 
-        rv = write(1, prompt, strlen(prompt));
         if (!rv) { 
             finished = 1;
             break;
@@ -349,10 +460,13 @@ void flushAndResetMain() {
 void execute(char *cmd, struct Navigation *nav, struct Debugger *debug) {
     //preprocess the command string to interpolate environment variables and format piping/redirection
     cmd = preprocess(cmd);
-    
+    //if the preprocessor stripped the entire string, ignore that line
+    if(strlen(cmd) == 0) {
+        return;
+    }
+
     char *tokenizedString = malloc(MAX_INPUT+1);
     strcpy(tokenizedString, cmd);
-
     //parse all the provided commands, redirects, and pipes as a collection of Payloads
     struct Payload **Processes = parsePayloads(debug, tokenizedString);
     int num;
@@ -562,12 +676,9 @@ struct Payload scrapeArguments(char **token, const char *delimiters, char* parse
 
 char* preprocess(char *cmd) {
     char* noComments = cutComments(cmd);
-    printf("\n%s\n", noComments);
-    exit(0);
     char* interpolated = interpolate(noComments);    
     char* pipeSafe = sanitizeRedirectsAndPipes(interpolated);
     //free buffers that will no longer be used
-    
     if(containsComments(cmd) != -1) {
         free(noComments);
     }
@@ -875,6 +986,10 @@ int formatExternalCommand(struct Payload **Process, char *token) {
         //attempt a search in $PATH environment variable    
         if(!isAbsoluteOrRelativePath(token)) {
             strcpy(pathAttempts, getenv("PATH"));
+            //also search in current directory
+            strcat(pathAttempts, ":");
+            strcat(pathAttempts, getenv("PWD"));
+            strcat(pathAttempts, ":");
             char file[MAX_INPUT];
             strcpy(file, token);
             absoluteFilePath = findBinary(pathAttempts, file);
@@ -905,10 +1020,8 @@ int formatExternalCommand(struct Payload **Process, char *token) {
 }
 char* interpolate(char *token) {
     if(token == NULL || strlen(token) == 0 || !hasVar(token)) {
-        printf("wtf");
         return token;
     } else {
-        printf("here");
         char *buffer = malloc(MAX_INPUT);
         char *interpolatedVar = malloc(MAX_INPUT); 
         int tokenTick, bufferTick = 0, varTick = 0;
@@ -997,7 +1110,8 @@ char* findBinary(char *path, char *fileName) {
         strcat(completeFileName, "/");
         strcat(completeFileName, fileName);
         //check first to see if the file exists and we have executable permissions
-        if(isXFile(completeFileName)) {
+        //isXFile will check for executable permissions
+        if(isFile(completeFileName)) {
             free(paths);
             return completeFileName;
         }
@@ -1242,16 +1356,7 @@ void printProcess(struct Payload Process) {
 }
 
 
-//scrape given arguments for the developer option
-void setDebugger(int argCount, char **args) {
-    char *optionTarget = "-d";
-    int i;
-    for(i=1;i<argCount;i++) {
-        if(strlen(args[i]) == 2 && strncmp(args[i], optionTarget, strlen(optionTarget))==0) {
-            DEBUG_MODE = 1;
-        }
-    }
-}
+
 
 void updateAndLogLaunch(struct Debugger *debug, char *token) {
     memset(debug->cmd, '\0', MAX_INPUT);
