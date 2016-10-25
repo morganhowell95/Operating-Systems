@@ -89,6 +89,7 @@ static inline int size2level (ssize_t size) {
     return -1;
 }
 
+
 static inline
 struct superblock_bookkeeping * alloc_super (int power) {
 
@@ -135,6 +136,7 @@ void *malloc(size_t size) {
   struct superblock_bookkeeping *bkeep;
   void *rv = NULL;
   int power = size2level(size);
+
   
   // Check that the allocation isn't too big or too small
   if (size > MAX_ALLOC) {
@@ -144,14 +146,11 @@ void *malloc(size_t size) {
     return NULL;
   }
   
- // Delete the following two lines
-  errno = -ENOMEM;
-  return rv;
-
   pool = &levels[power];
 
   if (!pool->free_objects) {
     bkeep = alloc_super(power);
+	printf("new superblock has been created and affixed at level: %d\n", power);
   } else
     bkeep = pool->next;
 
@@ -172,6 +171,7 @@ void *malloc(size_t size) {
       rv = (void *) next;
       if(free_objects == bkeep->free_count) {
         levels[power].whole_superblocks--;
+		printf("Number of clear superblocks decreased");
       }
       levels[power].free_objects--;
       bkeep->free_count--;
@@ -197,13 +197,26 @@ struct superblock_bookkeeping * obj2bkeep (void *ptr) {
 
 void free(void *ptr) {
   struct superblock_bookkeeping *bkeep = obj2bkeep(ptr);
+  struct object *next = (struct object *) ptr;
+  next->next = bkeep->free_list;
+  bkeep->free_list = next;
+  bkeep->free_count++;
+  int level = bkeep->level;
+  levels[level].free_objects++;
+  int maxObjectsForPool = (SUPER_BLOCK_SIZE/(2 << (level+4)))-1;
+  printf("\n free count for ptr: %d\n", bkeep->free_count);
+  if(bkeep->free_count == maxObjectsForPool) {
+		  levels[level].whole_superblocks++;
+		  printf("\nSuperblock completely free\n");
+  }
 
   // Your code here.
   //   Be sure to put this back on the free list, and update the
-  //   free count.  If you add the final object back to a superblock,
+  //   free count.i  If you add the final object back to a superblock,
   //   making all objects free, increment whole_superblocks.
+  
 
-  /* Exercise 3: Poison a newly freed object to detect use-after-free errors.
+  /*iiasdfadsf Exercise 3: Poison a newly freed object to detect use-after-free errors.
    * Hint: use FREE_POISON.
    */
 
