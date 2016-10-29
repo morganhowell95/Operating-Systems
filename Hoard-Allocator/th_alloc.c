@@ -27,7 +27,10 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/mman.h>
- 
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+
 #define assert(cond) if (!(cond)) __asm__ __volatile__ ("int $3")
 
 /* Object: One return from malloc/input to free. */
@@ -89,6 +92,9 @@ static inline int size2level (ssize_t size) {
     return -1;
 }
 
+static inline int maxObjectsForLevel(int level) {
+	return (SUPER_BLOCK_SIZE/(2 << (level+4)))-1;
+}
 
 static inline
 struct superblock_bookkeeping * alloc_super (int power) {
@@ -150,9 +156,9 @@ void *malloc(size_t size) {
 
   if (!pool->free_objects) {
     bkeep = alloc_super(power);
-	printf("new superblock has been created and affixed at level: %d\n", power);
-  } else
+  } else {
     bkeep = pool->next;
+  }
 
   //size of fresh (unused) super block
   int bytes_per_object = 2<<(power+4);
@@ -171,12 +177,13 @@ void *malloc(size_t size) {
       rv = (void *) next;
       if(free_objects == bkeep->free_count) {
         levels[power].whole_superblocks--;
-		printf("Number of clear superblocks decreased");
       }
       levels[power].free_objects--;
       bkeep->free_count--;
       break;
-    }
+    } else {
+		bkeep = bkeep->next;
+	}
   }
 
   // assert that rv doesn't end up being NULL at this point
@@ -185,6 +192,7 @@ void *malloc(size_t size) {
   /* Exercise 3: Poison a newly allocated object to detect init errors.
    * Hint: use ALLOC_POISON
    */
+  memset(rv, ALLOC_POISON, bytes_per_object);
   return rv;
 }
 
@@ -196,39 +204,66 @@ struct superblock_bookkeeping * obj2bkeep (void *ptr) {
 }
 
 void free(void *ptr) {
+  if(ptr == NULL) return;
+
   struct superblock_bookkeeping *bkeep = obj2bkeep(ptr);
   struct object *next = (struct object *) ptr;
+  int level = bkeep->level;
+  //we must poison the pointer before we manipulate the next attribute, otherwise we would erase the linkages within free_list
+  memset(ptr, FREE_POISON, 2 << (level+4));
+
   next->next = bkeep->free_list;
   bkeep->free_list = next;
   bkeep->free_count++;
-  int level = bkeep->level;
   levels[level].free_objects++;
-  int maxObjectsForPool = (SUPER_BLOCK_SIZE/(2 << (level+4)))-1;
-  printf("\n free count for ptr: %d\n", bkeep->free_count);
+  int maxObjectsForPool = maxObjectsForLevel(level);
   if(bkeep->free_count == maxObjectsForPool) {
 		  levels[level].whole_superblocks++;
-		  printf("\nSuperblock completely free\n");
   }
 
-  // Your code here.
-  //   Be sure to put this back on the free list, and update the
-  //   free count.i  If you add the final object back to a superblock,
-  //   making all objects free, increment whole_superblocks.
-  
-
-  /*iiasdfadsf Exercise 3: Poison a newly freed object to detect use-after-free errors.
-   * Hint: use FREE_POISON.
-   */
-
-  while (levels[bkeep->level].whole_superblocks > RESERVE_SUPERBLOCK_THRESHOLD) {
+  struct superblock_pool *pool = &levels[bkeep->level];
+  struct superblock_bookkeeping *potentialTargetRemoval = pool->next;
+  struct superblock_bookkeeping *prevFreeNode = NULL;
+  //need to provide safety for the case of the first superblock not being empty
+  //this ensures that the pool will point to the correct head of the linked list
+  int hasFoundNonEmpty = 0;
+  while (pool->whole_superblocks > RESERVE_SUPERBLOCK_THRESHOLD) {;
     // Exercise 4: Your code here
     // Remove a whole superblock from the level
     // Return that superblock to the OS, using mmunmap
-
-    break; // hack to keep this loop from hanging; remove in ex 4
+	//if this is a free superblock we will remove it from the linked list and decrement whole_superblocks
+	if(potentialTargetRemoval->free_count == maxObjectsForLevel(level)){
+		if(!hasFoundNonEmpty) {
+			//if we unmapped the very first super block, we want the pool to refer to the next one
+			pool->next = potentialTargetRemoval->next;
+			munmap(potentialTargetRemoval, SUPER_BLOCK_SIZE);
+			potentialTargetRemoval = pool->next;
+			pool->whole_superblocks--;
+			pool->free_objects -= maxObjectsForLevel(level);
+		} else {
+			//since we have already found a nonempty node, we can safely assume that this is the head of the LL
+			//which is referenced by the level pool, so we can simply "skip" the node we wish to delete and unmap it
+			prevFreeNode->next = potentialTargetRemoval->next;
+			munmap(potentialTargetRemoval, SUPER_BLOCK_SIZE);
+			pool->whole_superblocks--;
+			pool->free_objects -= maxObjectsForLevel(level);
+			potentialTargetRemoval = prevFreeNode->next;
+		}
+	//when we find a node that is non-empty, we want to use this as an anchor node that we will use to "skip" nodes
+	//that we wish to delete in the future
+	} else {
+		if(!hasFoundNonEmpty) {
+			pool->next = potentialTargetRemoval;
+		}
+		hasFoundNonEmpty = 1;
+		prevFreeNode = potentialTargetRemoval;
+		potentialTargetRemoval = potentialTargetRemoval->next;
+	}
+		
   }
   
 }
+
 
 // Do NOT touch this - this will catch any attempt to load this into a multi-threaded app
 int pthread_create(void __attribute__((unused)) *x, ...) {
